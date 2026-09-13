@@ -135,6 +135,15 @@ def platform_arch(docker_platform):
     return _ARCH_ALIASES.get(parts[1].lower()) if len(parts) > 1 else None
 
 
+def progress_description(eval_results, infra_errors):
+    """Running accuracy over the instances that actually ran, plus the excluded count."""
+    if eval_results:
+        desc = f"Accuracy: {sum(eval_results.values()) / len(eval_results):.2%}"
+    else:
+        desc = "Accuracy: n/a"
+    return f"{desc} ({len(infra_errors)} infra err)" if infra_errors else desc
+
+
 def container_diagnostics(container, tail=50):
     """The container's own stdio.
 
@@ -630,8 +639,7 @@ def main():
     with open(args.patch_path, "r") as f:
         patches_to_run = json.load(f)
     eval_results = {}
-    # Instances that never ran. Recorded so the run can say which ones; still scored
-    # below, exactly as before.
+    # Instances that never ran, kept apart from instances that ran and failed.
     infra_errors = {}
 
     # Filter patches to only include those with matching instance_ids in the raw sample data
@@ -721,30 +729,37 @@ def main():
                         eval_results[instance_id] = result
 
             except InfrastructureError as exc:
+                # Never scored, so not an unresolved instance either.
                 print(f'Evaluation for {patch_sample["instance_id"]} could not run: {exc}')
                 infra_errors[patch_sample["instance_id"]] = str(exc)
-                eval_results[patch_sample["instance_id"]] = False
             except Exception as exc:
                 print(f'Evaluation for {patch_sample["instance_id"]} generated an exception: {exc}')
                 eval_results[patch_sample["instance_id"]] = False
-            pbar.set_description(
-                f"Accuracy: {sum(eval_results.values()) / len(eval_results):.2%}"
-            )
+            pbar.set_description(progress_description(eval_results, infra_errors))
 
     with open(os.path.join(args.output_dir, "eval_results.json"), "w") as f:
         json.dump(eval_results, f)
-    # Written so a run says which instances never started -- on every run, even a clean
-    # one, so a later --redo in the same output_dir cannot leave the previous run's list
-    # behind to describe this one. They are still counted as failures in the accuracy
-    # below, as they were before this change.
+    # Reported separately and left out of the accuracy denominator: these instances never
+    # ran, so scoring them as failures would understate the result by exactly the number of
+    # broken environments -- which is how an architecture mismatch turns into a
+    # plausible-looking number. Written even when empty, like eval_results.json above: a
+    # later --redo in the same output_dir would otherwise leave the previous run's list
+    # behind to describe this one.
     with open(os.path.join(args.output_dir, "infra_errors.json"), "w") as f:
         json.dump(infra_errors, f, indent=2)
     if infra_errors:
         print(
-            f"{len(infra_errors)} instance(s) could not be evaluated and are counted as "
-            f"failures in the accuracy below; see infra_errors.json"
+            f"{len(infra_errors)} instance(s) could not be evaluated and are excluded from "
+            f"the accuracy below; see infra_errors.json"
         )
-    print("Overall accuracy: ", sum(eval_results.values()) / len(eval_results))
+    if eval_results:
+        print(
+            "Overall accuracy: ",
+            sum(eval_results.values()) / len(eval_results),
+            f"({len(eval_results)} of {len(valid_patches)} instances scored)",
+        )
+    else:
+        print(f"No instances were scored out of {len(valid_patches)}.")
 
 
 if __name__ == "__main__":
